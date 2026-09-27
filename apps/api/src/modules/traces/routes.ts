@@ -7,7 +7,15 @@ import { AppError, zodFields } from '../../lib/errors.js';
 import { currentUser, requireAuth } from '../../lib/auth.js';
 import { isRestoreWindowOpen, normalizeText, validatePageRange, validateSinglePage } from '../../lib/domain.js';
 import { writeEvent } from '../../lib/events.js';
-import { optionalDate, paginationFromQuery, parseId } from '../../lib/http.js';
+import { optionalDate, parseId } from '../../lib/http.js';
+import { assertSameFilters, buildCursorPage, parsePageQuery } from '../../lib/cursor.js';
+import {
+  countTracesLegacy,
+  findTracePage,
+  findTracesOffset,
+  type TraceListFilters,
+  type TraceRow
+} from '../../lib/traces-query.js';
 
 const optionalReason = (max: number) =>
   z.preprocess(
@@ -64,7 +72,7 @@ const rereadUpdateSchema = z
 
 const deleteSchema = z.object({ version: z.number().int().positive().optional() }).optional();
 
-function serializeDogEar(item: {
+type DogEarShape = {
   id: string;
   bookId: string;
   version: number;
@@ -72,11 +80,9 @@ function serializeDogEar(item: {
   reason: string | null;
   createdAt: Date;
   updatedAt: Date;
-}) {
-  return { ...item, type: 'DOG_EAR' as const };
-}
+};
 
-function serializeAnnotation(item: {
+type AnnotationShape = {
   id: string;
   bookId: string;
   version: number;
@@ -85,20 +91,49 @@ function serializeAnnotation(item: {
   content: string;
   createdAt: Date;
   updatedAt: Date;
-}) {
+};
+
+function serializeDogEar(item: DogEarShape) {
+  return { ...item, type: 'DOG_EAR' as const };
+}
+
+function serializeAnnotation(item: AnnotationShape) {
   return { ...item, type: 'ANNOTATION' as const };
 }
 
-function serializeRereadMark(item: {
-  id: string;
-  bookId: string;
-  version: number;
-  pageNumber: number;
-  reason: string | null;
-  createdAt: Date;
-  updatedAt: Date;
-}) {
+function serializeRereadMark(item: DogEarShape) {
   return { ...item, type: 'REREAD_MARK' as const };
+}
+
+function serializeTrace(row: TraceRow) {
+  if (row.traceType === 'DOG_EAR') return serializeDogEar({
+    id: row.id,
+    bookId: row.bookId,
+    version: row.version,
+    pageNumber: row.pageNumber as number,
+    reason: row.reason,
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt
+  });
+  if (row.traceType === 'ANNOTATION') return serializeAnnotation({
+    id: row.id,
+    bookId: row.bookId,
+    version: row.version,
+    startPage: row.startPage as number,
+    endPage: row.endPage as number,
+    content: row.content as string,
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt
+  });
+  return serializeRereadMark({
+    id: row.id,
+    bookId: row.bookId,
+    version: row.version,
+    pageNumber: row.pageNumber as number,
+    reason: row.reason,
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt
+  });
 }
 
 function assertVersion(current: number, requested?: number): void {
@@ -111,6 +146,37 @@ function eventSummary(value: string | null | undefined): string {
   return (value ? normalizeText(value).slice(0, 120) : '');
 }
 
+interface TraceFilters {
+  type?: TraceType;
+  pageNumber?: number;
+  keyword?: string;
+  from?: string;
+  to?: string;
+}
+
+function readTraceFilters(query: Record<string, unknown>): TraceFilters {
+  const rawType = typeof query.type === 'string' && query.type !== 'ALL' ? query.type : undefined;
+  if (rawType && !TRACE_TYPES.includes(rawType as TraceType)) {
+    throw new AppError(422, 'VALIDATION_ERROR', '痕迹类型无效');
+  }
+  const rawPageNumber = query.pageNumber === undefined ? undefined : Number(query.pageNumber);
+  if (rawPageNumber !== undefined && (!Number.isInteger(rawPageNumber) || rawPageNumber < 1)) {
+    throw new AppError(422, 'VALIDATION_ERROR', '页码无效');
+  }
+  const keyword = typeof query.keyword === 'string' ? query.keyword.trim() : '';
+  const from = optionalDate(query.from, 'from');
+  const to = optionalDate(query.to, 'to');
+
+  // 固定键顺序构造，游标内外产出可比较的过滤快照
+  const filters: TraceFilters = {};
+  if (rawType) filters.type = rawType as TraceType;
+  if (rawPageNumber !== undefined) filters.pageNumber = rawPageNumber;
+  if (keyword) filters.keyword = keyword;
+  if (from) filters.from = from.toISOString();
+  if (to) filters.to = to.toISOString();
+  return filters;
+}
+
 export const traceRoutes: FastifyPluginAsync = async (app) => {
   app.addHook('preHandler', requireAuth);
 
@@ -121,73 +187,71 @@ export const traceRoutes: FastifyPluginAsync = async (app) => {
     if (!book) throw new AppError(404, 'NOT_FOUND', '书目不存在');
 
     const query = request.query as Record<string, unknown>;
-    const type = typeof query.type === 'string' && query.type !== 'ALL' ? query.type : undefined;
-    if (type && !TRACE_TYPES.includes(type as TraceType)) {
-      throw new AppError(422, 'VALIDATION_ERROR', '痕迹类型无效');
-    }
-    const pageNumber = query.pageNumber === undefined ? undefined : Number(query.pageNumber);
-    if (pageNumber !== undefined && (!Number.isInteger(pageNumber) || pageNumber < 1)) {
-      throw new AppError(422, 'VALIDATION_ERROR', '页码无效');
-    }
-    const keyword = typeof query.keyword === 'string' ? query.keyword.trim() : '';
-    const from = optionalDate(query.from, 'from');
-    const to = optionalDate(query.to, 'to');
-    const dateFilter = {
-      ...(from ? { gte: from } : {}),
-      ...(to ? { lte: to } : {})
+    const filters = readTraceFilters(query);
+    const listFilters: TraceListFilters = {
+      userId,
+      bookId,
+      ...(filters.type ? { type: filters.type } : {}),
+      ...(filters.pageNumber !== undefined ? { pageNumber: filters.pageNumber } : {}),
+      ...(filters.keyword ? { keyword: filters.keyword } : {}),
+      ...(filters.from ? { from: filters.from } : {}),
+      ...(filters.to ? { to: filters.to } : {})
     };
-    const { page, pageSize } = paginationFromQuery(request);
+    const pageQuery = parsePageQuery<TraceFilters>(query);
 
-    const [dogEars, annotations, rereadMarks] = await Promise.all([
-      !type || type === 'DOG_EAR'
-        ? prisma.dogEar.findMany({
-            where: {
-              userId,
-              bookId,
-              deletedAt: null,
-              ...(pageNumber ? { pageNumber } : {}),
-              ...(keyword ? { reason: { contains: keyword, mode: 'insensitive' } } : {}),
-              ...(from || to ? { createdAt: dateFilter } : {})
-            },
-            orderBy: { createdAt: 'desc' }
-          })
-        : [],
-      !type || type === 'ANNOTATION'
-        ? prisma.annotation.findMany({
-            where: {
-              userId,
-              bookId,
-              deletedAt: null,
-              ...(pageNumber ? { startPage: { lte: pageNumber }, endPage: { gte: pageNumber } } : {}),
-              ...(keyword ? { content: { contains: keyword, mode: 'insensitive' } } : {}),
-              ...(from || to ? { createdAt: dateFilter } : {})
-            },
-            orderBy: { createdAt: 'desc' }
-          })
-        : [],
-      !type || type === 'REREAD_MARK'
-        ? prisma.rereadMark.findMany({
-            where: {
-              userId,
-              bookId,
-              deletedAt: null,
-              ...(pageNumber ? { pageNumber } : {}),
-              ...(keyword ? { reason: { contains: keyword, mode: 'insensitive' } } : {}),
-              ...(from || to ? { createdAt: dateFilter } : {})
-            },
-            orderBy: { createdAt: 'desc' }
-          })
-        : []
-    ]);
+    if (pageQuery.mode === 'offset') {
+      const [total, rows] = await Promise.all([
+        countTracesLegacy(listFilters),
+        findTracesOffset(listFilters, pageQuery.page, pageQuery.pageSize)
+      ]);
+      return {
+        items: rows.map(serializeTrace),
+        pagination: { page: pageQuery.page, pageSize: pageQuery.pageSize, total }
+      };
+    }
 
-    const merged = [
-      ...dogEars.map(serializeDogEar),
-      ...annotations.map(serializeAnnotation),
-      ...rereadMarks.map(serializeRereadMark)
-    ].sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
-    const total = merged.length;
-    const items = merged.slice((page - 1) * pageSize, page * pageSize);
-    return { items, pagination: { page, pageSize, total } };
+    // 快照键集分页：created_at 不可变，id 决胜；三类痕迹在数据库内归并，
+    // 单页扫描量与痕迹总量无关，索引重建或并发软删除都不会漂移。
+    const activeFilters = pageQuery.cursor ? pageQuery.cursor.f : filters;
+    if (pageQuery.cursor) assertSameFilters(filters, activeFilters);
+    const direction = pageQuery.cursor?.d ?? 'next';
+    const snapshotAt = pageQuery.cursor ? new Date(pageQuery.cursor.s) : new Date();
+
+    const activeListFilters: TraceListFilters = {
+      userId,
+      bookId,
+      ...(activeFilters.type ? { type: activeFilters.type } : {}),
+      ...(activeFilters.pageNumber !== undefined ? { pageNumber: activeFilters.pageNumber } : {}),
+      ...(activeFilters.keyword ? { keyword: activeFilters.keyword } : {}),
+      ...(activeFilters.from ? { from: activeFilters.from } : {}),
+      ...(activeFilters.to ? { to: activeFilters.to } : {})
+    };
+
+    const found = await findTracePage({
+      filters: activeListFilters,
+      pageSize: pageQuery.pageSize,
+      snapshotAt,
+      direction,
+      boundary: pageQuery.cursor
+        ? { at: new Date(pageQuery.cursor.t), id: pageQuery.cursor.i }
+        : undefined
+    });
+
+    const hasMore = found.length > pageQuery.pageSize;
+    const rows = found.slice(0, pageQuery.pageSize);
+    if (direction === 'prev') rows.reverse();
+
+    const page = buildCursorPage({
+      snapshotAt,
+      direction,
+      pageSize: pageQuery.pageSize,
+      filters: activeFilters,
+      rows: rows.map((row) => ({ at: row.createdAt, id: row.id })),
+      hasMore,
+      isHeadPage: !pageQuery.cursor
+    });
+
+    return { items: rows.map(serializeTrace), page };
   });
 
   app.post('/books/:bookId/dog-ears', async (request, reply) => {

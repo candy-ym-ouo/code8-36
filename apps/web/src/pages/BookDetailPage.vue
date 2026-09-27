@@ -2,6 +2,7 @@
 import { computed, onMounted, reactive, ref } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 import { ApiError } from '../api/client';
+import { cursorQuery } from '../api/cursor';
 import { booksApi, reflectionApi, traceApi } from '../api';
 import { formatDate, formatDateTime } from '../api/format';
 import ErrorNotice from '../components/ErrorNotice.vue';
@@ -30,6 +31,7 @@ const bookId = computed(() => String(route.params.bookId));
 const book = ref<Book | null>(null);
 const bookView = computed(() => book.value as Book);
 const traces = ref<Trace[]>([]);
+const tracesTruncated = ref(false);
 const reflections = ref<Reflection[]>([]);
 const activities = ref<Array<{ id: string; action: keyof typeof ACTION_LABELS; entityType: keyof typeof ENTITY_LABELS; payload: Record<string, unknown>; occurredAt: string }>>([]);
 const loading = ref(true);
@@ -102,32 +104,30 @@ function canEditReflection(reflection: Reflection): boolean {
   return new Date(reflection.editableUntil).getTime() >= Date.now();
 }
 
-async function loadAllTraces(id: string): Promise<Trace[]> {
-  const all: Trace[] = [];
-  let page = 1;
-  let total = 0;
-  do {
-    const params = new URLSearchParams({ page: String(page), pageSize: '100' });
-    const result = await booksApi.traces(id, params);
-    all.push(...result.items);
-    total = result.pagination.total;
-    page += 1;
-  } while (all.length < total && page <= 100);
-  return all;
+const TRACE_PREVIEW_PAGE_SIZE = 100;
+
+// 详情页不再循环拉取全部痕迹：超大痕迹量下旧实现会发起至多 100 个请求、
+// 把整张列表装入内存。只取快照首页；全量回看请使用时间线的游标翻页。
+async function loadLatestTraces(
+  id: string
+): Promise<{ items: Trace[]; truncated: boolean }> {
+  const result = await booksApi.traces(id, cursorQuery({ pageSize: TRACE_PREVIEW_PAGE_SIZE }));
+  return { items: result.items.slice(0, TRACE_PREVIEW_PAGE_SIZE), truncated: result.items.length >= TRACE_PREVIEW_PAGE_SIZE };
 }
 
 async function load(): Promise<void> {
   loading.value = true;
   error.value = '';
   try {
-    const [bookResult, loadedTraces, reflectionResult, timelineResult] = await Promise.all([
+    const [bookResult, traceResult, reflectionResult, timelineResult] = await Promise.all([
       booksApi.get(bookId.value),
-      loadAllTraces(bookId.value),
+      loadLatestTraces(bookId.value),
       booksApi.reflections(bookId.value),
-      timelineApi.list(new URLSearchParams({ bookId: bookId.value, pageSize: '100' }))
+      timelineApi.list(cursorQuery({ pageSize: 100, extra: { bookId: bookId.value } }))
     ]);
     book.value = bookResult.book;
-    traces.value = loadedTraces;
+    traces.value = traceResult.items;
+    tracesTruncated.value = traceResult.truncated;
     reflections.value = reflectionResult.items;
     activities.value = timelineResult.items;
   } catch (caught) {
@@ -475,6 +475,10 @@ onMounted(load);
           <button class="button button-primary" type="submit" :disabled="saving">保存痕迹</button>
         </div>
       </form>
+
+      <p v-if="tracesTruncated" class="muted truncation-hint">
+        痕迹较多，这里只展示最近 {{ TRACE_PREVIEW_PAGE_SIZE }} 条；完整记录请在下方“本书时间线”中按游标翻页查看。
+      </p>
 
       <div class="tabs" role="tablist">
         <button

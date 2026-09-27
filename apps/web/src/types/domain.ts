@@ -99,6 +99,31 @@ export interface Pagination {
   total: number;
 }
 
+/**
+ * 快照键集分页响应。游标内嵌快照时刻、过滤条件与边界行键，
+ * 历史 page/pageSize（OFFSET）响应仍返回 Pagination。
+ */
+export interface CursorPage<F = Record<string, unknown>> {
+  pageSize: number;
+  snapshotAt: string;
+  hasMore: boolean;
+  nextCursor: string | null;
+  prevCursor: string | null;
+  filters: F;
+}
+
+export interface CursorEnvelope<T, F = Record<string, unknown>> {
+  items: T[];
+  page: CursorPage<F>;
+}
+
+export interface OffsetEnvelope<T> {
+  items: T[];
+  pagination: Pagination;
+}
+
+export type PageEnvelope<T, F = Record<string, unknown>> = CursorEnvelope<T, F> | OffsetEnvelope<T>;
+
 export const MOOD_LABELS: Record<MoodTag, string> = {
   MOVED: '被触动',
   CALM: '平静',

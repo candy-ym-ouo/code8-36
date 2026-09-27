@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { onMounted, ref } from 'vue';
+import { computed, onMounted, ref } from 'vue';
 import { ApiError } from '../api/client';
+import { cursorQuery } from '../api/cursor';
 import { booksApi, timelineApi } from '../api';
 import { formatDateTime } from '../api/format';
 import ErrorNotice from '../components/ErrorNotice.vue';
@@ -11,9 +12,18 @@ import {
   type ActivityAction,
   type ActivityEntityType,
   type Book,
+  type CursorPage,
   type MoodTag,
   type TimelineEvent
 } from '../types/domain';
+
+interface TimelineFilters {
+  bookId?: string;
+  action?: ActivityAction;
+  entityType?: ActivityEntityType;
+  from?: string;
+  to?: string;
+}
 
 const events = ref<TimelineEvent[]>([]);
 const books = ref<Book[]>([]);
@@ -24,28 +34,51 @@ const action = ref<'ALL' | ActivityAction>('ALL');
 const entityType = ref<'ALL' | ActivityEntityType>('ALL');
 const from = ref('');
 const to = ref('');
-const page = ref(1);
 const pageSize = 30;
-const total = ref(0);
+const pageInfo = ref<CursorPage<TimelineFilters> | null>(null);
 
-function params(): URLSearchParams {
-  const value = new URLSearchParams({ page: String(page.value), pageSize: String(pageSize) });
-  if (bookId.value) value.set('bookId', bookId.value);
-  if (action.value !== 'ALL') value.set('eventType', action.value);
-  if (entityType.value !== 'ALL') value.set('entityType', entityType.value);
-  if (from.value) value.set('from', new Date(`${from.value}T00:00:00`).toISOString());
-  if (to.value) value.set('to', new Date(`${to.value}T23:59:59.999`).toISOString());
-  return value;
+function extraParams(): Record<string, string> {
+  const params: Record<string, string> = {};
+  if (bookId.value) params.bookId = bookId.value;
+  if (action.value !== 'ALL') params.eventType = action.value;
+  if (entityType.value !== 'ALL') params.entityType = entityType.value;
+  if (from.value) params.from = new Date(`${from.value}T00:00:00`).toISOString();
+  if (to.value) params.to = new Date(`${to.value}T23:59:59.999`).toISOString();
+  return params;
 }
 
-async function load(): Promise<void> {
+async function loadHead(): Promise<void> {
   loading.value = true;
   error.value = '';
   try {
-    const result = await timelineApi.list(params());
-    events.value = result.items;
-    total.value = result.pagination.total;
+    const result = await timelineApi.list(cursorQuery({ pageSize, extra: extraParams() }));
+    if ('page' in result) {
+      events.value = result.items;
+      pageInfo.value = result.page;
+    }
   } catch (caught) {
+    error.value = caught instanceof ApiError ? caught.message : '时间线加载失败';
+  } finally {
+    loading.value = false;
+  }
+}
+
+async function loadCursor(cursor: string | null): Promise<void> {
+  if (!cursor) return;
+  loading.value = true;
+  error.value = '';
+  try {
+    // 游标已冻结过滤条件，只透传 pageSize 与游标，避免快照被新谓词撕裂
+    const result = await timelineApi.list(cursorQuery({ pageSize, cursor }));
+    if ('page' in result) {
+      events.value = result.items;
+      pageInfo.value = result.page;
+    }
+  } catch (caught) {
+    if (caught instanceof ApiError && (caught.code === 'CURSOR_INVALID' || caught.code === 'CURSOR_FILTER_MISMATCH')) {
+      await loadHead();
+      return;
+    }
     error.value = caught instanceof ApiError ? caught.message : '时间线加载失败';
   } finally {
     loading.value = false;
@@ -54,17 +87,20 @@ async function load(): Promise<void> {
 
 async function loadBooks(): Promise<void> {
   try {
-    const result = await booksApi.list(new URLSearchParams({ page: '1', pageSize: '100' }));
-    books.value = result.items;
+    const result = await booksApi.list(cursorQuery({ pageSize: 100 }));
+    if ('items' in result) books.value = result.items;
   } catch {
     books.value = [];
   }
 }
 
 function filter(): void {
-  page.value = 1;
-  void load();
+  void loadHead();
 }
+
+const snapshotLabel = computed(() =>
+  pageInfo.value ? `本页快照：${formatDateTime(pageInfo.value.snapshotAt)}（翻页期间新变化不会扰动当前列表）` : ''
+);
 
 function summary(event: TimelineEvent): string {
   const payload = event.payload;
@@ -83,7 +119,7 @@ function summary(event: TimelineEvent): string {
 }
 
 onMounted(async () => {
-  await Promise.all([loadBooks(), load()]);
+  await Promise.all([loadBooks(), loadHead()]);
 });
 </script>
 
@@ -130,27 +166,42 @@ onMounted(async () => {
       <h2>这个范围内还没有变化</h2>
       <p>创建书目或留下第一处阅读痕迹后，时间会从这里开始。</p>
     </div>
-    <div v-else class="timeline-page-list">
-      <article v-for="event in events" :key="event.id" class="timeline-item card">
-        <span class="timeline-dot" aria-hidden="true" />
-        <div class="timeline-content">
-          <div class="timeline-heading">
-            <strong>{{ ACTION_LABELS[event.action] }} · {{ ENTITY_LABELS[event.entityType] }}</strong>
-            <time :datetime="event.occurredAt">{{ formatDateTime(event.occurredAt) }}</time>
+    <template v-else>
+      <p v-if="snapshotLabel" class="muted snapshot-hint">{{ snapshotLabel }}</p>
+      <div class="timeline-page-list">
+        <article v-for="event in events" :key="event.id" class="timeline-item card">
+          <span class="timeline-dot" aria-hidden="true" />
+          <div class="timeline-content">
+            <div class="timeline-heading">
+              <strong>{{ ACTION_LABELS[event.action] }} · {{ ENTITY_LABELS[event.entityType] }}</strong>
+              <time :datetime="event.occurredAt">{{ formatDateTime(event.occurredAt) }}</time>
+            </div>
+            <p>
+              <RouterLink v-if="event.bookId" :to="`/books/${event.bookId}`">{{ event.bookTitle }}</RouterLink>
+              <span v-else>{{ event.bookTitle }}</span>
+              <span v-if="summary(event)"> · {{ summary(event) }}</span>
+            </p>
           </div>
-          <p>
-            <RouterLink v-if="event.bookId" :to="`/books/${event.bookId}`">{{ event.bookTitle }}</RouterLink>
-            <span v-else>{{ event.bookTitle }}</span>
-            <span v-if="summary(event)"> · {{ summary(event) }}</span>
-          </p>
-        </div>
-      </article>
-    </div>
+        </article>
+      </div>
 
-    <nav v-if="total > pageSize" class="pagination" aria-label="时间线分页">
-      <button class="button button-quiet" :disabled="page <= 1" @click="page--; load()">上一页</button>
-      <span>第 {{ page }} 页，共 {{ Math.ceil(total / pageSize) }} 页</span>
-      <button class="button button-quiet" :disabled="page >= Math.ceil(total / pageSize)" @click="page++; load()">下一页</button>
-    </nav>
+      <nav v-if="pageInfo && (pageInfo.prevCursor || pageInfo.nextCursor)" class="pagination" aria-label="时间线分页">
+        <button
+          class="button button-quiet"
+          :disabled="!pageInfo.prevCursor"
+          @click="loadCursor(pageInfo?.prevCursor ?? null)"
+        >
+          上一页
+        </button>
+        <button class="button button-quiet" type="button" @click="filter">回到最新</button>
+        <button
+          class="button button-quiet"
+          :disabled="!pageInfo.nextCursor"
+          @click="loadCursor(pageInfo?.nextCursor ?? null)"
+        >
+          下一页
+        </button>
+      </nav>
+    </template>
   </section>
 </template>

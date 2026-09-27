@@ -7,7 +7,8 @@ import { AppError, zodFields } from '../../lib/errors.js';
 import { currentUser, requireAuth } from '../../lib/auth.js';
 import { normalizeMoodTags, normalizeText, validateStatusTransition } from '../../lib/domain.js';
 import { writeEvent } from '../../lib/events.js';
-import { paginationFromQuery, parseId } from '../../lib/http.js';
+import { parseId } from '../../lib/http.js';
+import { assertSameFilters, buildCursorPage, parsePageQuery } from '../../lib/cursor.js';
 
 const nullableText = (max: number) =>
   z.preprocess(
@@ -149,82 +150,163 @@ async function maximumTracePage(userId: string, bookId: string): Promise<number>
   );
 }
 
+interface BookListFilters {
+  status?: BookStatus;
+  search?: string;
+}
+
+function readBookFilters(query: Record<string, unknown>): BookListFilters {
+  const status = typeof query.status === 'string' && query.status !== 'ALL' ? query.status : undefined;
+  const search = typeof query.search === 'string' ? query.search.trim() : '';
+  if (status && !BOOK_STATUSES.includes(status as BookStatus)) {
+    throw new AppError(422, 'VALIDATION_ERROR', '书目状态无效');
+  }
+  const filters: BookListFilters = {};
+  if (status) filters.status = status as BookStatus;
+  if (search) filters.search = search;
+  return filters;
+}
+
+const bookCountInclude = {
+  _count: {
+    select: {
+      dogEars: { where: { deletedAt: null } },
+      annotations: { where: { deletedAt: null } },
+      rereadMarks: { where: { deletedAt: null } },
+      reflections: { where: { deletedAt: null } }
+    }
+  }
+} satisfies Prisma.BookInclude;
+
+async function latestTraceTimes(userId: string, ids: string[]): Promise<Map<string, Date | null>> {
+  if (!ids.length) return new Map();
+  const latestEvents = await prisma.activityEvent.groupBy({
+    by: ['bookId'],
+    where: {
+      userId,
+      bookId: { in: ids },
+      entityType: { in: ['DOG_EAR', 'ANNOTATION', 'REREAD_MARK'] },
+      action: { in: ['CREATED', 'UPDATED', 'RESTORED'] }
+    },
+    _max: { occurredAt: true }
+  });
+  return new Map(
+    latestEvents.flatMap((event) => (event.bookId ? ([[event.bookId, event._max.occurredAt]] as const) : []))
+  );
+}
+
+function serializeBookListItem(
+  book: Prisma.BookGetPayload<{ include: typeof bookCountInclude }>,
+  latestMap: Map<string, Date | null>
+) {
+  return {
+    ...serializeBook(book),
+    traceSummary: {
+      dogEars: book._count.dogEars,
+      annotations: book._count.annotations,
+      rereadMarks: book._count.rereadMarks
+    },
+    hasCompletionReflection: book._count.reflections > 0,
+    lastTraceAt: latestMap.get(book.id) ?? null
+  };
+}
+
 export const bookRoutes: FastifyPluginAsync = async (app) => {
   app.addHook('preHandler', requireAuth);
 
   app.get('/books', async (request) => {
-    const { page, pageSize, skip } = paginationFromQuery(request);
-    const query = request.query as Record<string, unknown>;
-    const status = typeof query.status === 'string' && query.status !== 'ALL' ? query.status : undefined;
-    const search = typeof query.search === 'string' ? query.search.trim() : '';
+    const pageQuery = parsePageQuery<BookListFilters>(request.query as Record<string, unknown>);
+    const filters = readBookFilters(request.query as Record<string, unknown>);
     const userId = currentUser(request).id;
 
-    if (status && !BOOK_STATUSES.includes(status as BookStatus)) {
-      throw new AppError(422, 'VALIDATION_ERROR', '书目状态无效');
-    }
-
-    const where: Prisma.BookWhereInput = {
+    const baseClause = (f: BookListFilters): Prisma.BookWhereInput => ({
       userId,
-      deletedAt: null,
-      ...(status ? { status: status as BookStatus } : {}),
-      ...(search
+      ...(f.status ? { status: f.status } : {}),
+      ...(f.search
         ? {
             OR: [
-              { title: { contains: search, mode: 'insensitive' } },
-              { author: { contains: search, mode: 'insensitive' } }
+              { title: { contains: f.search, mode: 'insensitive' } },
+              { author: { contains: f.search, mode: 'insensitive' } }
             ]
           }
         : {})
-    };
+    });
 
-    const [total, books] = await Promise.all([
-      prisma.book.count({ where }),
-      prisma.book.findMany({
-        where,
-        orderBy: { updatedAt: 'desc' },
-        skip,
-        take: pageSize,
-        include: {
-          _count: {
-            select: {
-              dogEars: { where: { deletedAt: null } },
-              annotations: { where: { deletedAt: null } },
-              rereadMarks: { where: { deletedAt: null } },
-              reflections: { where: { deletedAt: null } }
-            }
-          }
-        }
-      })
-    ]);
-
-    const ids = books.map((book) => book.id);
-    const latestEvents = ids.length
-      ? await prisma.activityEvent.groupBy({
-          by: ['bookId'],
-          where: {
-            userId,
-            bookId: { in: ids },
-            entityType: { in: ['DOG_EAR', 'ANNOTATION', 'REREAD_MARK'] },
-            action: { in: ['CREATED', 'UPDATED', 'RESTORED'] }
-          },
-          _max: { occurredAt: true }
+    if (pageQuery.mode === 'offset') {
+      const where: Prisma.BookWhereInput = { ...baseClause(filters), deletedAt: null };
+      const [total, books] = await Promise.all([
+        prisma.book.count({ where }),
+        prisma.book.findMany({
+          where,
+          orderBy: { updatedAt: 'desc' },
+          skip: pageQuery.skip,
+          take: pageQuery.pageSize,
+          include: bookCountInclude
         })
-      : [];
-    const latestMap = new Map(latestEvents.map((event) => [event.bookId, event._max.occurredAt]));
+      ]);
+      const latestMap = await latestTraceTimes(userId, books.map((book) => book.id));
+      return {
+        items: books.map((book) => serializeBookListItem(book, latestMap)),
+        pagination: { page: pageQuery.page, pageSize: pageQuery.pageSize, total }
+      };
+    }
 
-    return {
-      items: books.map((book) => ({
-        ...serializeBook(book),
-        traceSummary: {
-          dogEars: book._count.dogEars,
-          annotations: book._count.annotations,
-          rereadMarks: book._count.rereadMarks
-        },
-        hasCompletionReflection: book._count.reflections > 0,
-        lastTraceAt: latestMap.get(book.id) ?? null
-      })),
-      pagination: { page, pageSize, total }
-    };
+    // 快照键集分页：排序键 (updated_at, id) 对已存在行不可变，
+    // 并发更新不会让行在页间漂移；软删除行被快照谓词整体隐藏。
+    const activeFilters = pageQuery.cursor ? pageQuery.cursor.f : filters;
+    if (pageQuery.cursor) assertSameFilters(filters, activeFilters);
+    const direction = pageQuery.cursor?.d ?? 'next';
+    const snapshotAt = pageQuery.cursor ? new Date(pageQuery.cursor.s) : new Date();
+
+    const clauses: Prisma.BookWhereInput[] = [
+      baseClause(activeFilters),
+      // 快照可见性：创建于快照之前，且在快照时刻仍未删除
+      { createdAt: { lte: snapshotAt } },
+      { OR: [{ deletedAt: null }, { deletedAt: { gt: snapshotAt } }] }
+    ];
+    if (pageQuery.cursor) {
+      const boundaryAt = new Date(pageQuery.cursor.t);
+      const boundaryId = pageQuery.cursor.i;
+      clauses.push(
+        pageQuery.cursor.d === 'next'
+          ? {
+              OR: [
+                { updatedAt: { lt: boundaryAt } },
+                { updatedAt: boundaryAt, id: { lt: boundaryId } }
+              ]
+            }
+          : {
+              OR: [
+                { updatedAt: { gt: boundaryAt } },
+                { updatedAt: boundaryAt, id: { gt: boundaryId } }
+              ]
+            }
+      );
+    }
+
+    const found = await prisma.book.findMany({
+      where: { AND: clauses },
+      orderBy: direction === 'next' ? [{ updatedAt: 'desc' }, { id: 'desc' }] : [{ updatedAt: 'asc' }, { id: 'asc' }],
+      take: pageQuery.pageSize + 1,
+      include: bookCountInclude
+    });
+
+    const hasMore = found.length > pageQuery.pageSize;
+    const books = found.slice(0, pageQuery.pageSize);
+    if (direction === 'prev') books.reverse();
+    const latestMap = await latestTraceTimes(userId, books.map((book) => book.id));
+
+    const page = buildCursorPage({
+      snapshotAt,
+      direction,
+      pageSize: pageQuery.pageSize,
+      filters: activeFilters,
+      rows: books.map((book) => ({ at: book.updatedAt, id: book.id })),
+      hasMore,
+      isHeadPage: !pageQuery.cursor
+    });
+
+    return { items: books.map((book) => serializeBookListItem(book, latestMap)), page };
   });
 
   app.post('/books', async (request, reply) => {

@@ -3,6 +3,7 @@ import type {
   Annotation,
   Book,
   BookStatus,
+  CursorEnvelope,
   DogEar,
   MoodTag,
   Pagination,
@@ -35,7 +36,8 @@ export const authApi = {
 };
 
 export const booksApi = {
-  list: (params: URLSearchParams) => api.get<{ items: Book[]; pagination: Pagination }>(`/books?${params}`),
+  list: (params: URLSearchParams) =>
+    api.get<CursorEnvelope<Book> | { items: Book[]; pagination: Pagination }>(`/books?${params}`),
   get: (id: string) => api.get<{ book: Book }>(`/books/${id}`),
   create: (body: BookPayload) => api.post<{ book: Book }>('/books', body),
   update: (id: string, body: Partial<BookPayload> & { version: number }) =>
@@ -46,7 +48,9 @@ export const booksApi = {
   ) => api.patch<{ book: Book; reflection?: Reflection }>(`/books/${id}/status`, body),
   delete: (id: string, version: number) => api.delete<void>(`/books/${id}`, { version }),
   traces: (id: string, params: URLSearchParams) =>
-    api.get<{ items: Trace[]; pagination: Pagination }>(`/books/${id}/traces?${params}`),
+    api.get<CursorEnvelope<Trace> | { items: Trace[]; pagination: Pagination }>(
+      `/books/${id}/traces?${params}`
+    ),
   reflections: (id: string) => api.get<{ items: Reflection[] }>(`/books/${id}/reflections`)
 };
 
@@ -82,7 +86,9 @@ export const reflectionApi = {
 
 export const timelineApi = {
   list: (params: URLSearchParams) =>
-    api.get<{ items: TimelineEvent[]; pagination: Pagination }>(`/timeline?${params}`)
+    api.get<CursorEnvelope<TimelineEvent> | { items: TimelineEvent[]; pagination: Pagination }>(
+      `/timeline?${params}`
+    )
 };
 
 export const exportApi = {

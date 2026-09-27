@@ -108,6 +108,7 @@ model Book {
   @@index([userId, deletedAt, updatedAt])
   @@index([userId, status])
   @@index([userId, title])
+  @@index([userId, updatedAt(sort: Desc), id(sort: Desc)])
   @@map("books")
 }
 
@@ -125,7 +126,7 @@ model DogEar {
   user User @relation(fields: [userId], references: [id], onDelete: Restrict)
   book Book @relation(fields: [bookId], references: [id], onDelete: Restrict)
 
-  @@index([userId, deletedAt, createdAt])
+  @@index([userId, bookId, createdAt(sort: Desc), id(sort: Desc)])
   @@index([bookId, pageNumber, deletedAt])
   @@map("dog_ears")
 }
@@ -145,7 +146,7 @@ model Annotation {
   user User @relation(fields: [userId], references: [id], onDelete: Restrict)
   book Book @relation(fields: [bookId], references: [id], onDelete: Restrict)
 
-  @@index([userId, deletedAt, createdAt])
+  @@index([userId, bookId, createdAt(sort: Desc), id(sort: Desc)])
   @@index([bookId, startPage, endPage, deletedAt])
   @@map("annotations")
 }
@@ -164,7 +165,7 @@ model RereadMark {
   user User @relation(fields: [userId], references: [id], onDelete: Restrict)
   book Book @relation(fields: [bookId], references: [id], onDelete: Restrict)
 
-  @@index([userId, deletedAt, createdAt])
+  @@index([userId, bookId, createdAt(sort: Desc), id(sort: Desc)])
   @@index([bookId, pageNumber, deletedAt])
   @@map("reread_marks")
 }
@@ -204,8 +205,8 @@ model ActivityEvent {
   user User  @relation(fields: [userId], references: [id], onDelete: Restrict)
   book Book? @relation(fields: [bookId], references: [id], onDelete: Restrict)
 
-  @@index([userId, occurredAt])
-  @@index([userId, bookId, occurredAt])
-  @@index([userId, entityType, occurredAt])
+  @@index([userId, occurredAt(sort: Desc), id(sort: Desc)])
+  @@index([userId, bookId, occurredAt(sort: Desc), id(sort: Desc)])
+  @@index([userId, entityType, occurredAt(sort: Desc), id(sort: Desc)])
   @@map("activity_events")
 }

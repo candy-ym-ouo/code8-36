@@ -94,6 +94,14 @@ npm run dev
 - 书目和痕迹使用 `version` 防止多端写入覆盖。
 - 所有查询强制带 `userId` 条件，越权资源统一返回 404。
 
+## 列表分页
+
+- 列表接口（`/books`、`/books/:bookId/traces`、`/timeline`）默认使用**快照键集分页**：请求带 `mode=cursor`，首页不传 `cursor`，响应返回 `page.nextCursor` / `page.prevCursor`。
+- 游标为不透明 base64url 字符串，内嵌快照时刻、过滤条件与边界行不可变排序键（`occurredAt/createdAt/updatedAt` + `id`）。翻页期间的并发写入、软删除或索引重建都不会让页项漂移、重复或丢失；同一游标可随时复算出同一结果集。
+- 历史客户端无需改造：不带 `mode=cursor` 时仍接受 `page` / `pageSize`（OFFSET），响应仍是 `{ items, pagination: { page, pageSize, total } }`。
+- 游标翻页时不能更换过滤条件；条件变化请丢弃游标重新取首页（服务端返回 `CURSOR_FILTER_MISMATCH`）。游标损坏返回 `CURSOR_INVALID`。
+- 痕迹列表通过 `book_trace_rows` UNION 视图在数据库内归并三类痕迹，每个分支每一页只扫描 `pageSize+1` 行，不再全量装载。
+
 ## 常用命令
 
 ```bash
