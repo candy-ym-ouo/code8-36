@@ -94,9 +94,15 @@ export interface TimelineEvent {
 }
 
 export interface Pagination {
-  page: number;
   pageSize: number;
-  total: number;
+  /** 历史 page 模式返回 */
+  page?: number;
+  /** 历史 page 模式返回 */
+  total?: number;
+  /** 游标模式返回：下一页游标，没有更多时为 null */
+  nextCursor?: string | null;
+  /** 游标模式返回 */
+  hasMore?: boolean;
 }
 
 export const MOOD_LABELS: Record<MoodTag, string> = {

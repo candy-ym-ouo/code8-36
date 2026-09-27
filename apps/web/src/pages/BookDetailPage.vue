@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref } from 'vue';
+import { computed, onMounted, reactive, ref, watch } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 import { ApiError } from '../api/client';
 import { booksApi, reflectionApi, traceApi } from '../api';
@@ -30,8 +30,13 @@ const bookId = computed(() => String(route.params.bookId));
 const book = ref<Book | null>(null);
 const bookView = computed(() => book.value as Book);
 const traces = ref<Trace[]>([]);
+const tracesCursor = ref<string | null>(null);
+const tracesHasMore = ref(false);
+const tracesLoading = ref(false);
 const reflections = ref<Reflection[]>([]);
 const activities = ref<Array<{ id: string; action: keyof typeof ACTION_LABELS; entityType: keyof typeof ENTITY_LABELS; payload: Record<string, unknown>; occurredAt: string }>>([]);
+const activitiesCursor = ref<string | null>(null);
+const activitiesHasMore = ref(false);
 const loading = ref(true);
 const saving = ref(false);
 const error = ref('');
@@ -65,7 +70,12 @@ const tabs = computed(() => [
 
 const visibleTraces = computed(() => {
   const filtered = activeTab.value === 'PAGES' ? traces.value : traces.value.filter((trace) => trace.type === activeTab.value);
-  return [...filtered].sort((a, b) => tracePage(a) - tracePage(b) || b.createdAt.localeCompare(a.createdAt));
+  return [...filtered].sort((a, b) => {
+    const byPage = tracePage(a) - tracePage(b);
+    if (byPage !== 0) return byPage;
+    if (a.createdAt !== b.createdAt) return a.createdAt < b.createdAt ? 1 : -1;
+    return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+  });
 });
 
 const statusActions = computed(() => {
@@ -102,40 +112,90 @@ function canEditReflection(reflection: Reflection): boolean {
   return new Date(reflection.editableUntil).getTime() >= Date.now();
 }
 
-async function loadAllTraces(id: string): Promise<Trace[]> {
-  const all: Trace[] = [];
-  let page = 1;
-  let total = 0;
-  do {
-    const params = new URLSearchParams({ page: String(page), pageSize: '100' });
-    const result = await booksApi.traces(id, params);
-    all.push(...result.items);
-    total = result.pagination.total;
-    page += 1;
-  } while (all.length < total && page <= 100);
-  return all;
+function activeTraceType(): TraceType | null {
+  return activeTab.value === 'DOG_EAR' || activeTab.value === 'ANNOTATION' || activeTab.value === 'REREAD_MARK'
+    ? activeTab.value
+    : null;
+}
+
+let tracesRequestId = 0;
+let activitiesRequestId = 0;
+
+async function loadTraces(reset: boolean): Promise<void> {
+  const requestId = ++tracesRequestId;
+  if (reset) {
+    traces.value = [];
+    tracesCursor.value = null;
+    tracesHasMore.value = false;
+  }
+  tracesLoading.value = true;
+  try {
+    const params = new URLSearchParams({ pageSize: '50', cursor: reset ? '' : tracesCursor.value ?? '' });
+    const type = activeTraceType();
+    if (type) params.set('type', type);
+    const result = await booksApi.traces(bookId.value, params);
+    if (requestId !== tracesRequestId) return;
+    traces.value = reset ? result.items : [...traces.value, ...result.items];
+    tracesCursor.value = result.pagination.nextCursor ?? null;
+    tracesHasMore.value = Boolean(result.pagination.hasMore && result.pagination.nextCursor);
+  } catch (caught) {
+    if (requestId === tracesRequestId) {
+      error.value = caught instanceof ApiError ? caught.message : '阅读痕迹加载失败';
+    }
+  } finally {
+    if (requestId === tracesRequestId) tracesLoading.value = false;
+  }
+}
+
+async function loadActivities(reset: boolean): Promise<void> {
+  const requestId = ++activitiesRequestId;
+  if (reset) {
+    activities.value = [];
+    activitiesCursor.value = null;
+    activitiesHasMore.value = false;
+  }
+  try {
+    const params = new URLSearchParams({
+      bookId: bookId.value,
+      pageSize: '50',
+      cursor: reset ? '' : activitiesCursor.value ?? ''
+    });
+    const result = await timelineApi.list(params);
+    if (requestId !== activitiesRequestId) return;
+    activities.value = reset ? result.items : [...activities.value, ...result.items];
+    activitiesCursor.value = result.pagination.nextCursor ?? null;
+    activitiesHasMore.value = Boolean(result.pagination.hasMore && result.pagination.nextCursor);
+  } catch (caught) {
+    if (requestId === activitiesRequestId) {
+      error.value = caught instanceof ApiError ? caught.message : '时间线加载失败';
+    }
+  }
 }
 
 async function load(): Promise<void> {
   loading.value = true;
   error.value = '';
   try {
-    const [bookResult, loadedTraces, reflectionResult, timelineResult] = await Promise.all([
+    const [bookResult, reflectionResult] = await Promise.all([
       booksApi.get(bookId.value),
-      loadAllTraces(bookId.value),
       booksApi.reflections(bookId.value),
-      timelineApi.list(new URLSearchParams({ bookId: bookId.value, pageSize: '100' }))
+      loadTraces(true),
+      loadActivities(true)
     ]);
     book.value = bookResult.book;
-    traces.value = loadedTraces;
     reflections.value = reflectionResult.items;
-    activities.value = timelineResult.items;
   } catch (caught) {
     error.value = caught instanceof ApiError ? caught.message : '书目加载失败';
   } finally {
     loading.value = false;
   }
 }
+
+watch(activeTab, (tab) => {
+  if (tab === 'PAGES' || tab === 'DOG_EAR' || tab === 'ANNOTATION' || tab === 'REREAD_MARK') {
+    void loadTraces(true);
+  }
+});
 
 function resetTraceForm(): void {
   traceForm.pageNumber = '';
@@ -530,6 +590,15 @@ onMounted(load);
           </div>
         </article>
         <p v-if="activities.length === 0" class="empty-inline">这本书还没有变化记录。</p>
+        <button
+          v-if="activitiesHasMore"
+          class="button button-quiet button-block"
+          type="button"
+          :disabled="loading"
+          @click="loadActivities(false)"
+        >
+          加载更早的变化
+        </button>
       </div>
 
       <div v-else class="trace-list">
@@ -548,6 +617,15 @@ onMounted(load);
           <p class="muted">创建 {{ formatDateTime(trace.createdAt) }} · 更新 {{ formatDateTime(trace.updatedAt) }}</p>
         </article>
         <p v-if="visibleTraces.length === 0" class="empty-inline">这个分类还没有留下痕迹。</p>
+        <button
+          v-if="tracesHasMore"
+          class="button button-quiet button-block"
+          type="button"
+          :disabled="tracesLoading"
+          @click="loadTraces(false)"
+        >
+          {{ tracesLoading ? '正在加载…' : '加载更多痕迹' }}
+        </button>
       </div>
     </section>
   </section>

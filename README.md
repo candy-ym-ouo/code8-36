@@ -94,6 +94,15 @@ npm run dev
 - 书目和痕迹使用 `version` 防止多端写入覆盖。
 - 所有查询强制带 `userId` 条件，越权资源统一返回 404。
 
+## 分页契约
+
+痕迹列表（`GET /books/:id/traces`）与全局时间线（`GET /timeline`）支持两种分页方式：
+
+- **游标模式（推荐）**：请求带 `cursor` 参数（首页传空值 `cursor=`），响应返回 `pagination.nextCursor` 与 `pagination.hasMore`。排序是 `(created_at/occurred_at, id)` 的确定性全序，翻页通过 keyset 条件完成：不做 `count(*)`，不做深 `OFFSET`，内存与延迟只取决于页大小；并发写入和索引重建不会导致条目在页之间重复或丢失。游标是版本化的确定性编码，同一游标总能复算出同一页；非法游标返回 `422 INVALID_CURSOR`，不会静默跳回第一页。
+- **历史 page 模式（兼容）**：只带 `page`/`pageSize` 时保持旧行为与旧响应结构（`pagination.page/total`），但排序同样使用上述确定性全序。
+
+两种模式不得混用；同时提供时以 `cursor` 为准。前端列表均使用游标模式按需加载，不再一次性拉取全部痕迹。
+
 ## 常用命令
 
 ```bash

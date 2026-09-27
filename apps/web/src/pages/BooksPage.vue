@@ -27,7 +27,7 @@ async function load(): Promise<void> {
   try {
     const result = await booksApi.list(params);
     books.value = result.items;
-    total.value = result.pagination.total;
+    total.value = result.pagination.total ?? 0;
   } catch (caught) {
     error.value = caught instanceof ApiError ? caught.message : '书目加载失败';
   } finally {

@@ -26,10 +26,15 @@ const from = ref('');
 const to = ref('');
 const page = ref(1);
 const pageSize = 30;
-const total = ref(0);
+// 游标翻页：cursorStack 记录到达当前页之前每页使用的游标，用于“上一页”回退；
+// 同一游标总能复算出同一页，并发写入不会让条目在页之间漂移。
+const cursorStack = ref<string[]>([]);
+const currentCursor = ref('');
+const nextCursor = ref<string | null>(null);
+const hasMore = ref(false);
 
 function params(): URLSearchParams {
-  const value = new URLSearchParams({ page: String(page.value), pageSize: String(pageSize) });
+  const value = new URLSearchParams({ pageSize: String(pageSize), cursor: currentCursor.value });
   if (bookId.value) value.set('bookId', bookId.value);
   if (action.value !== 'ALL') value.set('eventType', action.value);
   if (entityType.value !== 'ALL') value.set('entityType', entityType.value);
@@ -44,7 +49,8 @@ async function load(): Promise<void> {
   try {
     const result = await timelineApi.list(params());
     events.value = result.items;
-    total.value = result.pagination.total;
+    nextCursor.value = result.pagination.nextCursor ?? null;
+    hasMore.value = Boolean(result.pagination.hasMore && result.pagination.nextCursor);
   } catch (caught) {
     error.value = caught instanceof ApiError ? caught.message : '时间线加载失败';
   } finally {
@@ -62,7 +68,25 @@ async function loadBooks(): Promise<void> {
 }
 
 function filter(): void {
+  cursorStack.value = [];
+  currentCursor.value = '';
   page.value = 1;
+  void load();
+}
+
+function nextPage(): void {
+  if (!nextCursor.value) return;
+  cursorStack.value.push(currentCursor.value);
+  currentCursor.value = nextCursor.value;
+  page.value += 1;
+  void load();
+}
+
+function prevPage(): void {
+  const previous = cursorStack.value.pop();
+  if (previous === undefined) return;
+  currentCursor.value = previous;
+  page.value -= 1;
   void load();
 }
 
@@ -147,10 +171,10 @@ onMounted(async () => {
       </article>
     </div>
 
-    <nav v-if="total > pageSize" class="pagination" aria-label="时间线分页">
-      <button class="button button-quiet" :disabled="page <= 1" @click="page--; load()">上一页</button>
-      <span>第 {{ page }} 页，共 {{ Math.ceil(total / pageSize) }} 页</span>
-      <button class="button button-quiet" :disabled="page >= Math.ceil(total / pageSize)" @click="page++; load()">下一页</button>
+    <nav v-if="page > 1 || hasMore" class="pagination" aria-label="时间线分页">
+      <button class="button button-quiet" :disabled="page <= 1" @click="prevPage">上一页</button>
+      <span>第 {{ page }} 页</span>
+      <button class="button button-quiet" :disabled="!hasMore" @click="nextPage">下一页</button>
     </nav>
   </section>
 </template>

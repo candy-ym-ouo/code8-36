@@ -5,6 +5,7 @@ import { prisma } from '../../lib/prisma.js';
 import { AppError } from '../../lib/errors.js';
 import { currentUser, requireAuth } from '../../lib/auth.js';
 import { optionalDate, paginationFromQuery, parseId } from '../../lib/http.js';
+import { decodeTimeIdCursor, encodeTimeIdCursor } from '../../lib/pagination.js';
 
 export const timelineRoutes: FastifyPluginAsync = async (app) => {
   app.addHook('preHandler', requireAuth);
@@ -42,6 +43,63 @@ export const timelineRoutes: FastifyPluginAsync = async (app) => {
         : {})
     };
 
+    const serialize = (event: {
+      id: string;
+      bookId: string | null;
+      entityType: ActivityEntityType;
+      entityId: string | null;
+      action: ActivityAction;
+      payloadJson: Prisma.JsonValue;
+      occurredAt: Date;
+      book: { title: string } | null;
+    }) => ({
+      id: event.id,
+      bookId: event.bookId,
+      bookTitle: event.book?.title ?? '已删除书目',
+      entityType: event.entityType,
+      entityId: event.entityId,
+      action: event.action,
+      payload: event.payloadJson,
+      occurredAt: event.occurredAt
+    });
+
+    if (query.cursor !== undefined) {
+      // keyset 翻页：不做 count(*)，并发写入与索引重建不会引起页项漂移。
+      const cursor = decodeTimeIdCursor(query.cursor);
+      const events = await prisma.activityEvent.findMany({
+        where: {
+          ...where,
+          ...(cursor
+            ? {
+                AND: [
+                  {
+                    OR: [
+                      { occurredAt: { lt: cursor.at } },
+                      { occurredAt: { equals: cursor.at }, id: { lt: cursor.id } }
+                    ]
+                  }
+                ]
+              }
+            : {})
+        },
+        orderBy: [{ occurredAt: 'desc' }, { id: 'desc' }],
+        take: pageSize + 1,
+        include: { book: { select: { title: true } } }
+      });
+      const hasMore = events.length > pageSize;
+      const pageEvents = hasMore ? events.slice(0, pageSize) : events;
+      const last = pageEvents[pageEvents.length - 1];
+      return {
+        items: pageEvents.map(serialize),
+        pagination: {
+          pageSize,
+          nextCursor: hasMore && last ? encodeTimeIdCursor({ at: last.occurredAt, id: last.id }) : null,
+          hasMore
+        }
+      };
+    }
+
+    // 历史 page 模式：保持旧的响应结构（page/total）。
     const [total, events] = await Promise.all([
       prisma.activityEvent.count({ where }),
       prisma.activityEvent.findMany({
@@ -54,16 +112,7 @@ export const timelineRoutes: FastifyPluginAsync = async (app) => {
     ]);
 
     return {
-      items: events.map((event) => ({
-        id: event.id,
-        bookId: event.bookId,
-        bookTitle: event.book?.title ?? '已删除书目',
-        entityType: event.entityType,
-        entityId: event.entityId,
-        action: event.action,
-        payload: event.payloadJson,
-        occurredAt: event.occurredAt
-      })),
+      items: events.map(serialize),
       pagination: { page, pageSize, total }
     };
   });

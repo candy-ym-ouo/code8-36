@@ -181,7 +181,7 @@ export const bookRoutes: FastifyPluginAsync = async (app) => {
       prisma.book.count({ where }),
       prisma.book.findMany({
         where,
-        orderBy: { updatedAt: 'desc' },
+        orderBy: [{ updatedAt: 'desc' }, { id: 'desc' }],
         skip,
         take: pageSize,
         include: {

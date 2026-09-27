@@ -8,6 +8,12 @@ import { currentUser, requireAuth } from '../../lib/auth.js';
 import { isRestoreWindowOpen, normalizeText, validatePageRange, validateSinglePage } from '../../lib/domain.js';
 import { writeEvent } from '../../lib/events.js';
 import { optionalDate, paginationFromQuery, parseId } from '../../lib/http.js';
+import { decodeTimeIdCursor, encodeTimeIdCursor } from '../../lib/pagination.js';
+import {
+  buildTraceCountQuery,
+  buildTracePageQuery,
+  type TraceRow
+} from '../../lib/tracePageQuery.js';
 
 const optionalReason = (max: number) =>
   z.preprocess(
@@ -111,6 +117,36 @@ function eventSummary(value: string | null | undefined): string {
   return (value ? normalizeText(value).slice(0, 120) : '');
 }
 
+type TraceItem =
+  | ReturnType<typeof serializeDogEar>
+  | ReturnType<typeof serializeAnnotation>
+  | ReturnType<typeof serializeRereadMark>;
+
+function rowToTrace(row: TraceRow): TraceItem {
+  const base = {
+    id: row.id,
+    bookId: row.book_id,
+    version: row.version,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at
+  };
+  if (row.type === 'ANNOTATION') {
+    return {
+      ...base,
+      startPage: row.start_page ?? 0,
+      endPage: row.end_page ?? 0,
+      content: row.content ?? '',
+      type: 'ANNOTATION' as const
+    };
+  }
+  return {
+    ...base,
+    pageNumber: row.page_number ?? 0,
+    reason: row.reason,
+    type: row.type
+  };
+}
+
 export const traceRoutes: FastifyPluginAsync = async (app) => {
   app.addHook('preHandler', requireAuth);
 
@@ -132,62 +168,48 @@ export const traceRoutes: FastifyPluginAsync = async (app) => {
     const keyword = typeof query.keyword === 'string' ? query.keyword.trim() : '';
     const from = optionalDate(query.from, 'from');
     const to = optionalDate(query.to, 'to');
-    const dateFilter = {
-      ...(from ? { gte: from } : {}),
-      ...(to ? { lte: to } : {})
+    const { page, pageSize, skip } = paginationFromQuery(request);
+    const usesCursor = query.cursor !== undefined;
+
+    const filters = {
+      userId,
+      bookId,
+      types: (type ? [type as TraceType] : TRACE_TYPES) as readonly TraceType[],
+      ...(pageNumber !== undefined ? { pageNumber } : {}),
+      ...(keyword ? { keyword } : {}),
+      ...(from ? { from } : {}),
+      ...(to ? { to } : {})
     };
-    const { page, pageSize } = paginationFromQuery(request);
 
-    const [dogEars, annotations, rereadMarks] = await Promise.all([
-      !type || type === 'DOG_EAR'
-        ? prisma.dogEar.findMany({
-            where: {
-              userId,
-              bookId,
-              deletedAt: null,
-              ...(pageNumber ? { pageNumber } : {}),
-              ...(keyword ? { reason: { contains: keyword, mode: 'insensitive' } } : {}),
-              ...(from || to ? { createdAt: dateFilter } : {})
-            },
-            orderBy: { createdAt: 'desc' }
-          })
-        : [],
-      !type || type === 'ANNOTATION'
-        ? prisma.annotation.findMany({
-            where: {
-              userId,
-              bookId,
-              deletedAt: null,
-              ...(pageNumber ? { startPage: { lte: pageNumber }, endPage: { gte: pageNumber } } : {}),
-              ...(keyword ? { content: { contains: keyword, mode: 'insensitive' } } : {}),
-              ...(from || to ? { createdAt: dateFilter } : {})
-            },
-            orderBy: { createdAt: 'desc' }
-          })
-        : [],
-      !type || type === 'REREAD_MARK'
-        ? prisma.rereadMark.findMany({
-            where: {
-              userId,
-              bookId,
-              deletedAt: null,
-              ...(pageNumber ? { pageNumber } : {}),
-              ...(keyword ? { reason: { contains: keyword, mode: 'insensitive' } } : {}),
-              ...(from || to ? { createdAt: dateFilter } : {})
-            },
-            orderBy: { createdAt: 'desc' }
-          })
-        : []
+    if (usesCursor) {
+      // keyset 翻页：内存与延迟只取决于页大小；并发写入与索引重建不会引起页项漂移。
+      const cursor = decodeTimeIdCursor(query.cursor);
+      const built = buildTracePageQuery({ ...filters, limit: pageSize + 1, cursor });
+      const rows = await prisma.$queryRawUnsafe<TraceRow[]>(built.text, ...built.values);
+      const hasMore = rows.length > pageSize;
+      const pageRows = hasMore ? rows.slice(0, pageSize) : rows;
+      const last = pageRows[pageRows.length - 1];
+      return {
+        items: pageRows.map(rowToTrace),
+        pagination: {
+          pageSize,
+          nextCursor: hasMore && last ? encodeTimeIdCursor({ at: last.created_at, id: last.id }) : null,
+          hasMore
+        }
+      };
+    }
+
+    // 历史 page 模式：保持旧的响应结构（page/total），同一确定性全序上的 OFFSET。
+    const pageQuery = buildTracePageQuery({ ...filters, limit: pageSize, offset: skip });
+    const countQuery = buildTraceCountQuery(filters);
+    const [rows, countRows] = await Promise.all([
+      prisma.$queryRawUnsafe<TraceRow[]>(pageQuery.text, ...pageQuery.values),
+      prisma.$queryRawUnsafe<Array<{ total: number }>>(countQuery.text, ...countQuery.values)
     ]);
-
-    const merged = [
-      ...dogEars.map(serializeDogEar),
-      ...annotations.map(serializeAnnotation),
-      ...rereadMarks.map(serializeRereadMark)
-    ].sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
-    const total = merged.length;
-    const items = merged.slice((page - 1) * pageSize, page * pageSize);
-    return { items, pagination: { page, pageSize, total } };
+    return {
+      items: rows.map(rowToTrace),
+      pagination: { page, pageSize, total: countRows[0]?.total ?? 0 }
+    };
   });
 
   app.post('/books/:bookId/dog-ears', async (request, reply) => {
